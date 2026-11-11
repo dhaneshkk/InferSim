@@ -1,4 +1,12 @@
+import copy
 import json
+
+
+def _first_present(d, keys, default=None):
+    for k in keys:
+        if k in d:
+            return d[k]
+    return default
 
 
 class ModelConfig:
@@ -28,9 +36,15 @@ class ModelConfig:
         self.num_linear_attn_layers = 0
         self.is_hybrid_linear = d.get("full_attention_interval") is not None
         if self.is_hybrid_linear:
-            self.num_full_attn_layers = (
-                self.num_hidden_layers // d["full_attention_interval"]
-            )
+            layer_types = d.get("layer_types")
+            if layer_types:
+                self.num_full_attn_layers = sum(
+                    1 for t in layer_types if t == "full_attention"
+                )
+            else:
+                self.num_full_attn_layers = (
+                    self.num_hidden_layers // d["full_attention_interval"]
+                )
             self.num_linear_attn_layers = (
                 self.num_hidden_layers - self.num_full_attn_layers
             )
@@ -46,6 +60,7 @@ class ModelConfig:
 
         # attn
         self.attn_output_gate = d.get("attn_output_gate", False)
+        self.index_topk = None
         if self.attn_type == "MHA/GQA":
             self.num_attention_heads = d["num_attention_heads"]
             self.num_key_value_heads = d["num_key_value_heads"]
@@ -64,16 +79,26 @@ class ModelConfig:
             self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
 
         # FFN/MoE
-        self.is_moe = True
-        if "num_routed_experts" in d:
-            self.num_routed_experts = d["num_routed_experts"]
-        elif "num_experts" in d:
-            self.num_routed_experts = d["num_experts"]
-        else:
-            self.is_moe = False
-            self.num_routed_experts = 1
+        # HF configs name the expert counts differently per family:
+        #   DeepSeek: n_routed_experts / n_shared_experts
+        #   Qwen:     num_experts / shared_expert_intermediate_size
+        num_routed = _first_present(
+            d, ["num_routed_experts", "n_routed_experts", "num_experts"]
+        )
+        self.is_moe = num_routed is not None and num_routed > 1
+        if num_routed is None and "moe_intermediate_size" in d:
+            raise ValueError(
+                f"{config_path}: has moe_intermediate_size but no expert count "
+                "(expected one of num_routed_experts, n_routed_experts, "
+                "num_experts)"
+            )
+
+        # Dense FFN width, used by dense models and by the dense layers of
+        # MoE models (e.g. DeepSeek first_k_dense_replace).
+        self.dense_intermediate_size = d.get("intermediate_size")
 
         if self.is_moe:
+            self.num_routed_experts = num_routed
             self.num_experts_per_tok = d["num_experts_per_tok"]
             self.intermediate_size = d["moe_intermediate_size"]
             self.shared_expert_intermediate_size = d.get(
@@ -89,12 +114,63 @@ class ModelConfig:
                     self.shared_expert_intermediate_size // self.intermediate_size
                 )
             else:
-                self.num_shared_experts = d.get("num_shared_experts", 0)
+                self.num_shared_experts = _first_present(
+                    d, ["num_shared_experts", "n_shared_experts"], 0
+                )
                 self.shared_expert_intermediate_size = (
                     self.num_shared_experts * self.intermediate_size
                 )
+            self.num_moe_layers = self._count_moe_layers(d)
         else:
+            self.num_routed_experts = 1
             self.num_experts_per_tok = 1
             self.intermediate_size = d["intermediate_size"]
             self.num_shared_experts = 0
             self.shared_expert_intermediate_size = 0
+            self.num_moe_layers = 0
+
+        # Layers whose FFN is a dense MLP rather than MoE.
+        self.num_dense_ffn_layers = self.num_hidden_layers - self.num_moe_layers
+        if self.is_moe and self.num_dense_ffn_layers > 0:
+            if not self.dense_intermediate_size:
+                raise ValueError(
+                    f"{config_path}: {self.num_dense_ffn_layers} dense FFN layers "
+                    "but no intermediate_size"
+                )
+
+    def _count_moe_layers(self, d):
+        """Count layers that use the MoE FFN.
+
+        Follows the HF modeling code of each family:
+          DeepSeek: MoE iff layer >= first_k_dense_replace and
+                    layer % moe_layer_freq == 0
+          Qwen MoE: MoE iff layer not in mlp_only_layers and
+                    (layer + 1) % decoder_sparse_step == 0
+        """
+        first_k_dense = d.get("first_k_dense_replace", 0) or 0
+        moe_layer_freq = d.get("moe_layer_freq", 1) or 1
+        mlp_only = set(d.get("mlp_only_layers", []) or [])
+        sparse_step = d.get("decoder_sparse_step", 1) or 1
+        count = 0
+        for i in range(self.num_hidden_layers):
+            if i < first_k_dense or i % moe_layer_freq != 0:
+                continue
+            if i in mlp_only or (i + 1) % sparse_step != 0:
+                continue
+            count += 1
+        return count
+
+    def dense_ffn_view(self):
+        """A copy of this config describing the dense FFN layers.
+
+        MoE models with dense layers (DeepSeek's first_k_dense_replace) cost
+        those layers as a dense MLP of ``dense_intermediate_size``.
+        """
+        view = copy.copy(self)
+        view.is_moe = False
+        view.num_routed_experts = 1
+        view.num_experts_per_tok = 1
+        view.num_shared_experts = 0
+        view.shared_expert_intermediate_size = 0
+        view.intermediate_size = self.dense_intermediate_size
+        return view

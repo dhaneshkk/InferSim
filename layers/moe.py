@@ -1,9 +1,14 @@
 from flops.flops import gemm_flops
 from hardware.gpu import TFLOPS_TO_GFLOPS, gpu_map
 from layers.attn import get_gemm_mfu_and_latency
-from mfu.mfu import (get_gemm_mfu, get_groupedgemm_decode_mfu,
-                     get_groupedgemm_prefill_mfu)
+from mfu.mfu import (
+    combine_up_down_mfu,
+    get_gemm_mfu,
+    get_groupedgemm_decode_mfu,
+    get_groupedgemm_prefill_mfu,
+)
 from params.params import get_expected_active_experts, load_moe_weights_time
+from utils.parallel import tp_intermediate
 
 
 class MoE:
@@ -27,15 +32,15 @@ class MoE:
         gpu = gpu_map[device_type]
 
         # TP shards intermediate_size; hidden_size is NOT sharded
-        tp_intermediate_size = self.config.intermediate_size // self.tp_size
+        tp_intermediate_size = tp_intermediate(self.config.intermediate_size, self.tp_size)
         routed_experts_gflops = gemm_flops(
             1, self.config.hidden_size, tp_intermediate_size
         )
         routed_experts_gflops *= bs * self.config.num_experts_per_tok * 3.0 / 1e9
 
         if self.config.is_moe:
-            routed_experts_mfu = max(
-                get_groupedgemm_decode_mfu(
+            routed_experts_mfu = combine_up_down_mfu(
+                *get_groupedgemm_decode_mfu(
                     self.config, bs, device_type, num_gpus, self.use_fp8_gemm, self.tp_size
                 )
             )
@@ -44,7 +49,7 @@ class MoE:
                 device_type,
                 bs,
                 self.config.hidden_size,
-                self.config.intermediate_size * 2 // num_gpus,
+                tp_intermediate_size * 2,
             )
 
         routed_experts_latency = routed_experts_gflops / (
@@ -116,7 +121,7 @@ class MoE:
         gpu = gpu_map[device_type]
 
         # TP shards intermediate_size; hidden_size is NOT sharded
-        tp_intermediate_size = self.config.intermediate_size // self.tp_size
+        tp_intermediate_size = tp_intermediate(self.config.intermediate_size, self.tp_size)
         routed_experts_gflops = gemm_flops(
             1, self.config.hidden_size, tp_intermediate_size
         )
@@ -125,8 +130,8 @@ class MoE:
         if self.prefill_mfu is not None:
             routed_experts_mfu = self.prefill_mfu
         elif self.config.is_moe:
-            routed_experts_mfu = max(
-                get_groupedgemm_prefill_mfu(
+            routed_experts_mfu = combine_up_down_mfu(
+                *get_groupedgemm_prefill_mfu(
                     self.config, seq_len, device_type, num_gpus, self.use_fp8_gemm, self.tp_size
                 )
             )
@@ -135,7 +140,7 @@ class MoE:
                 device_type,
                 seq_len,
                 self.config.hidden_size,
-                self.config.intermediate_size * 2 // num_gpus,
+                tp_intermediate_size * 2,
             )
 
         routed_experts_latency = routed_experts_gflops / (

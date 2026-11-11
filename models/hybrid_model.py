@@ -1,14 +1,24 @@
 import math
 
-from comm.comm import Comm
 from flops.flops import get_attn_gflops, get_moe_gflops
-from hardware.gpu import gpu_map
+from hardware.gpu import BYTES_PER_GIB, gpu_map
 from kvcache.kvcache import get_kvcache_size, get_states_size
 from layers.attn import create_attention
 from layers.linear_attn import create_linear_attn
-from layers.moe import MoE
-from params.params import (get_attn_params_size, get_expert_params_size,
-                           get_linear_attn_params_size)
+from models.common import (
+    HYBRID_DECODE_SCHEDULER_OVERHEAD_MS,
+    PREFILL_SCHEDULER_OVERHEAD_MS,
+    ffn_group_times,
+    ffn_params_gib_per_gpu,
+    reserved_kvcache_gib,
+    tp_all_reduce_time,
+)
+from params.params import (
+    get_attn_params_size,
+    get_expert_params_size,
+    get_linear_attn_params_size,
+)
+from utils.diagnostics import warn
 
 
 class HybridModel:
@@ -45,29 +55,16 @@ class HybridModel:
                 "One expert params size (MB):", expert_params_bytes / 1024 / 1024
             )
         )
-        # Unified split rule:
-        #   tp_size == 1 -> attn is DP (full), MoE routed experts split by EP (= world_size)
-        #   tp_size >  1 -> attn and MoE both split by TP only (no EP/world_size division)
-        if tp_size == 1:
-            ep_size = self.args.world_size
-            experts_on_gpu = (
-                self.config.num_shared_experts
-                + self.config.num_routed_experts / ep_size
-            )
-        else:
-            experts_on_gpu = (
-                self.config.num_shared_experts + self.config.num_routed_experts
-            )
-        params_per_gpu = expert_params_bytes * experts_on_gpu
-        params_per_gpu *= self.config.num_hidden_layers
-        params_per_gpu += self.config.num_full_attn_layers * full_attn_params_bytes
-        params_per_gpu += self.config.num_linear_attn_layers * linear_attn_params_bytes
-
-        params_per_gpu = params_per_gpu / 1024 / 1024 / 1024
-        self.kvcache_mem = (
-            self.gpu.mem - params_per_gpu - 15 - 5
-        )  # 15GB for runtime, 5GB for encoder
+        # Split rule: see utils/parallel.py
+        params_per_gpu = ffn_params_gib_per_gpu(
+            self.config, self.args.use_fp8_gemm, self.args.world_size, tp_size
+        )
+        params_per_gpu += (
+            self.config.num_full_attn_layers * full_attn_params_bytes
+            + self.config.num_linear_attn_layers * linear_attn_params_bytes
+        ) / BYTES_PER_GIB
         print("{:<40} {:<10.2f}".format("Per GPU params size (GB):", params_per_gpu))
+        self.kvcache_mem = reserved_kvcache_gib(self.gpu.mem, params_per_gpu)
 
     def print_kvcache_info(self):
         print("{s:{c}^{n}}".format(s="KV Cache", n=50, c="-"))
@@ -81,7 +78,7 @@ class HybridModel:
         print("{:<40} {:<10}".format("Input seq len:", self.args.target_isl))
         print("{:<40} {:<10}".format("Output seq len:", self.args.target_osl))
         print("{:<40} {:<10}".format("Target decode batchsize:", target_bs))
-        target_kvcache_bytes = self.kvcache_mem * 1024 * 1024 * 1024 / target_bs
+        target_kvcache_bytes = self.kvcache_mem * BYTES_PER_GIB / target_bs
         kvcache_bytes = (
             get_kvcache_size(self.config, self.args.use_fp8_kv, self.args.tp_size)
             / self.config.num_hidden_layers
@@ -98,7 +95,7 @@ class HybridModel:
                 kvcache_bytes / 1024 / 1024,
             )
         )
-        states_bytes = get_states_size(self.config)
+        states_bytes = get_states_size(self.config, self.args.tp_size)
         print(
             "{:<40} {:<10.2f}".format(
                 "Current per-req states size (MB):", states_bytes / 1024 / 1024
@@ -112,6 +109,7 @@ class HybridModel:
         )
         if kvcache_bytes + states_bytes > target_kvcache_bytes:
             print("!Error: need smaller kvcache")
+            warn("KV cache + states for the target batch do not fit in GPU memory")
         self.kvcache_bytes = kvcache_bytes / context_len
         self.states_bytes = states_bytes
         self.target_bs = target_bs
@@ -186,6 +184,8 @@ class HybridModel:
         t_full_attn_others = full_attn.prefill_attn_others(
             self.args.max_prefill_tokens, self.args.device_type
         )
+        # A chunk carries chunk/isl of a full sequence's attention cost
+        # (same rule as Model.prefill).
         t_full_attn_core *= self.args.max_prefill_tokens / self.args.target_isl
 
         # linear attn
@@ -200,34 +200,12 @@ class HybridModel:
             self.args.max_prefill_tokens, self.args.device_type
         )
 
-        # moe
-        moe = MoE(
-            self.config,
-            self.args.use_fp8_gemm,
-            self.args.tp_size,
-            getattr(self.args, "prefill_moe_mfu", None),
+        ffn_groups = ffn_group_times(
+            self.args, self.gpu, self.config, "prefill", self.args.max_prefill_tokens
         )
-        t_moe = moe.prefill_moe(
-            self.args.max_prefill_tokens, self.args.device_type, self.args.world_size
+        tp_comm = tp_all_reduce_time(
+            self.args, self.gpu, self.config, self.args.max_prefill_tokens
         )
-
-        comm = Comm(
-            self.config,
-            self.gpu,
-            self.args.world_size,
-            self.args.num_nodes,
-            self.args.enable_deepep,
-        )
-        comm_t1, comm_t2 = comm.prefill_comm(self.args.max_prefill_tokens)
-        print("{:<40} {:<10.2f}".format("Comm before MoE/FFN (us):", comm_t1 * 1e6))
-        print("{:<40} {:<10.2f}".format("Comm after MoE/FFN (us):", comm_t2 * 1e6))
-
-        # TP all_reduce communication time
-        tp_comm_time = comm.tp_all_reduce(
-            self.args.max_prefill_tokens, self.args.tp_size
-        )
-        if self.args.tp_size > 1:
-            print("{:<40} {:<10.2f}".format("TP all_reduce (us):", tp_comm_time * 1e6))
 
         num_tokens = self.args.max_prefill_tokens
         ttft = (
@@ -236,20 +214,16 @@ class HybridModel:
         ttft += (
             t_linear_attn_core + t_linear_attn_others
         ) * self.config.num_linear_attn_layers
-        ttft += t_moe * self.config.num_hidden_layers
-        if self.args.tp_size > 1:
-            ttft += 2 * tp_comm_time * self.config.num_hidden_layers
-        else:
-            ttft += (comm_t1 + comm_t2) * self.config.num_hidden_layers
+        for n, ffn_t, c1, c2 in ffn_groups:
+            ttft += n * (ffn_t + c1 + c2)
+        ttft += 2 * tp_comm * self.config.num_hidden_layers
         ttft *= 1000  # convert to ms
-        ttft += 30  # for scheduler
+        ttft += PREFILL_SCHEDULER_OVERHEAD_MS
 
+        tgs = num_tokens / self.args.tp_size / (ttft / 1000)
         print("{:<40} {:<10.2f}".format("TTFT (ms):", ttft))
-        print(
-            "{:<40} {:<10.0f}".format(
-                "Throughput (TGS:tok/GPU/s):", num_tokens / self.args.tp_size / (ttft / 1000)
-            )
-        )
+        print("{:<40} {:<10.0f}".format("Throughput (TGS:tok/GPU/s):", tgs))
+        return {"ttft_ms": ttft, "prefill_tgs": tgs}
 
     def decoding(self):
         print("{s:{c}^{n}}".format(s="Decoding", n=50, c="-"))
@@ -278,31 +252,17 @@ class HybridModel:
             self.target_bs, self.args.device_type
         )
 
-        moe = MoE(self.config, self.args.use_fp8_gemm, self.args.tp_size)
-        t_moe = moe.decode_moe(
+        ffn_groups = ffn_group_times(
+            self.args,
+            self.gpu,
+            self.config,
+            "decode",
             self.target_bs,
-            self.args.device_type,
-            self.args.world_size,
             overlap_shared_expert=getattr(
                 self.args, "enable_shared_expert_overlap", False
             ),
         )
-
-        comm = Comm(
-            self.config,
-            self.gpu,
-            self.args.world_size,
-            self.args.num_nodes,
-            self.args.enable_deepep,
-        )
-        comm_t1, comm_t2 = comm.decode_comm(self.target_bs)
-        print("{:<40} {:<10.2f}".format("Comm before MoE/FFN (us):", comm_t1 * 1e6))
-        print("{:<40} {:<10.2f}".format("Comm after MoE/FFN (us):", comm_t2 * 1e6))
-
-        # TP all_reduce communication time
-        tp_comm_time = comm.tp_all_reduce(self.target_bs, self.args.tp_size)
-        if self.args.tp_size > 1:
-            print("{:<40} {:<10.2f}".format("TP all_reduce (us):", tp_comm_time * 1e6))
+        tp_comm = tp_all_reduce_time(self.args, self.gpu, self.config, self.target_bs)
 
         num_tokens = self.target_bs
         tpot = (
@@ -311,20 +271,21 @@ class HybridModel:
         tpot += (
             t_linear_attn_core + t_linear_attn_others
         ) * self.config.num_linear_attn_layers
-        tpot += t_moe * self.config.num_hidden_layers
-        if self.args.tp_size > 1:
-            tpot += 2 * tp_comm_time * self.config.num_hidden_layers
-        else:
-            tpot += (comm_t1 + comm_t2) * self.config.num_hidden_layers
+        for n, ffn_t, c1, c2 in ffn_groups:
+            tpot += n * (ffn_t + c1 + c2)
+        tpot += 2 * tp_comm * self.config.num_hidden_layers
         tpot *= 1000  # convert to ms
         scheduler_overhead_ms = getattr(
             self.args, "decode_scheduler_overhead_ms", None
         )
         if scheduler_overhead_ms is None:
-            scheduler_overhead_ms = 2
+            scheduler_overhead_ms = HYBRID_DECODE_SCHEDULER_OVERHEAD_MS
         tpot += scheduler_overhead_ms
 
+        tgs = num_tokens / self.args.tp_size / (tpot / 1000)
         print("{:<40} {:<10.2f}".format("TPOT (ms):", tpot))
-        print("{:<40} {:<10.0f}".format("Throughput (TGS:tok/GPU/s):", num_tokens / self.args.tp_size / (tpot / 1000)))
+        print("{:<40} {:<10.0f}".format("Throughput (TGS:tok/GPU/s):", tgs))
         if tpot > self.args.target_tpot:
             print("!Error: TPOT > SLO, need smaller GFLOPs to speedup")
+            warn(f"TPOT {tpot:.2f} ms exceeds target {self.args.target_tpot} ms")
+        return {"tpot_ms": tpot, "decode_tgs": tgs}
