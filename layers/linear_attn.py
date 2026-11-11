@@ -1,28 +1,25 @@
-from hardware.gpu import gpu_map
+from hardware.gpu import gpu_map, transfer_time
 from layers.attn import get_gemm_mfu_and_latency
-from mfu.mfu import (get_linear_attn_decode_latency,
-                     get_linear_attn_prefill_latency)
+from mfu.mfu import get_linear_attn_decode_latency, get_linear_attn_prefill_latency
+from utils.parallel import tp_num_heads
 
 
 class GDN:
     def __init__(self, config, use_fp8_gemm, tp_size):
         self.use_fp8_gemm = use_fp8_gemm
         self.config = config
-        # NOTE: linear-attn head counts are currently NOT sharded, so tp_size
-        # has no effect on GEMM shapes here. Stored for interface consistency.
+        # TP shards linear-attn key/value heads, like full-attention heads.
         self.tp_size = tp_size
+        self.k_heads = tp_num_heads(config.linear_num_key_heads, tp_size)
+        self.v_heads = tp_num_heads(config.linear_num_value_heads, tp_size)
 
     def decode_attn_core(self, bs, states_bytes, device_type):
         gpu = gpu_map[device_type]
-        t_attn_core = get_linear_attn_decode_latency(self.config, bs, device_type)
-        t_states_load = (
-            states_bytes
-            * bs
-            / self.config.num_linear_attn_layers
-            / 1024
-            / 1024
-            / 1024
-            / gpu.mem_bw
+        t_attn_core = get_linear_attn_decode_latency(
+            self.config, bs, device_type, self.tp_size
+        )
+        t_states_load = transfer_time(
+            states_bytes * bs / self.config.num_linear_attn_layers, gpu.mem_bw
         )
 
         print("{:<40} {:<10.2f}".format("Linear attn core latency (us):", t_attn_core))
@@ -35,13 +32,11 @@ class GDN:
         return max(t_attn_core / 1e6, t_states_load)
 
     def decode_attn_others(self, bs, device_type):
-        # hidden_size is NOT sharded; linear-attn heads currently not sharded
-        key_dim = self.config.linear_num_key_heads * self.config.linear_key_head_dim
-        value_dim = (
-            self.config.linear_num_value_heads * self.config.linear_value_head_dim
-        )
+        # hidden_size is NOT sharded; linear-attn heads are sharded by TP
+        key_dim = self.k_heads * self.config.linear_key_head_dim
+        value_dim = self.v_heads * self.config.linear_value_head_dim
         projection_size_qkvz = key_dim * 2 + value_dim * 2
-        projection_size_ba = self.config.linear_num_value_heads * 2
+        projection_size_ba = self.v_heads * 2
         qkvz_proj = get_gemm_mfu_and_latency(
             m=bs,
             k=self.config.hidden_size,
@@ -58,7 +53,7 @@ class GDN:
 
         o_proj = get_gemm_mfu_and_latency(
             m=bs,
-            k=self.config.linear_num_value_heads * self.config.linear_value_head_dim,
+            k=value_dim,
             n=self.config.hidden_size,
             device_type=device_type,
             use_fp8_gemm=self.use_fp8_gemm,
@@ -68,14 +63,11 @@ class GDN:
 
     def prefill_attn_core(self, seq_len, states_bytes, device_type):
         gpu = gpu_map[device_type]
-        t_attn_core = get_linear_attn_prefill_latency(self.config, seq_len, device_type)
-        t_states_load = (
-            states_bytes
-            / self.config.num_linear_attn_layers
-            / 1024
-            / 1024
-            / 1024
-            / gpu.mem_bw
+        t_attn_core = get_linear_attn_prefill_latency(
+            self.config, seq_len, device_type, self.tp_size
+        )
+        t_states_load = transfer_time(
+            states_bytes / self.config.num_linear_attn_layers, gpu.mem_bw
         )
 
         print("{:<40} {:<10.2f}".format("Linear Attn core latency (us):", t_attn_core))

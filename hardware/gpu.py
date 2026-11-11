@@ -1,8 +1,19 @@
 from dataclasses import dataclass
 
-
 # FLOP rates use SI units: 1 TFLOP/s = 1000 GFLOP/s.
 TFLOPS_TO_GFLOPS = 1000.0
+
+# Bandwidths (mem_bw / nvlink_bw / rdma_bw) are vendor figures in SI GB/s
+# (1 GB/s = 1e9 bytes/s). Byte counts must therefore be divided by 1e9, not
+# 1024**3, before dividing by a bandwidth. Memory *capacity* (``mem``) is
+# HBM capacity, which is binary (GiB), and is compared against GiB values.
+BYTES_PER_GB = 1e9
+BYTES_PER_GIB = 1024**3
+
+
+def transfer_time(num_bytes, bw_gb_per_s):
+    """Seconds to move ``num_bytes`` at ``bw_gb_per_s`` (SI GB/s)."""
+    return num_bytes / BYTES_PER_GB / bw_gb_per_s
 
 
 @dataclass

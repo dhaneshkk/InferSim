@@ -58,7 +58,10 @@ class MLADecodeAttentionTest(unittest.TestCase):
                 device_type="H200",
             )
 
-        self.assertAlmostEqual(result, 0.0005208333333333333, places=15)
+        # KV bytes per layer * kv_len * bs over SI GB/s (H200: 4800 * 0.8)
+        kv_bytes = 61 * 1024**2 * 1024 * 2 / 61
+        expected = kv_bytes / 1e9 / (4800 * 0.8)
+        self.assertAlmostEqual(result, expected, places=15)
 
 
 if __name__ == "__main__":

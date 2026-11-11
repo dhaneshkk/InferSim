@@ -1,4 +1,5 @@
 from config.model_config import ModelConfig
+from utils.parallel import tp_intermediate, tp_num_heads, tp_num_kv_heads
 
 
 def gemm_flops(m, n, k):
@@ -7,58 +8,58 @@ def gemm_flops(m, n, k):
 
 def get_mha_gflops(config, bs, avg_context_len, tp_size):
     # TP shards heads; hidden_size is NOT sharded
-    tp_num_heads = config.num_attention_heads // tp_size
-    tp_num_kv_heads = config.num_key_value_heads // tp_size
+    tp_heads = tp_num_heads(config.num_attention_heads, tp_size)
+    tp_kv_heads = tp_num_kv_heads(config.num_key_value_heads, tp_size)
     q_multiplier = 2 if config.attn_output_gate else 1
 
     q_proj = gemm_flops(
         bs,
         config.hidden_size,
-        q_multiplier * tp_num_heads * config.head_dim,
+        q_multiplier * tp_heads * config.head_dim,
     )
     k_proj = gemm_flops(
-        bs, config.hidden_size, tp_num_kv_heads * config.head_dim
+        bs, config.hidden_size, tp_kv_heads * config.head_dim
     )
     v_proj = gemm_flops(
-        bs, config.hidden_size, tp_num_kv_heads * config.head_dim
+        bs, config.hidden_size, tp_kv_heads * config.head_dim
     )
     o_proj = gemm_flops(
-        bs, tp_num_heads * config.head_dim, config.hidden_size
+        bs, tp_heads * config.head_dim, config.hidden_size
     )
     attn_core = gemm_flops(
-        bs, tp_num_heads * config.head_dim, avg_context_len
-    ) + gemm_flops(bs, avg_context_len, tp_num_heads * config.head_dim)
+        bs, tp_heads * config.head_dim, avg_context_len
+    ) + gemm_flops(bs, avg_context_len, tp_heads * config.head_dim)
     return attn_core / 1e9, (q_proj + k_proj + v_proj + o_proj) / 1e9
 
 
 def get_mla_absorb_gflops(config, bs, avg_context_len, tp_size):
-    tp_num_heads = config.num_attention_heads // tp_size
+    tp_heads = tp_num_heads(config.num_attention_heads, tp_size)
     q_down_proj = gemm_flops(bs, config.hidden_size, config.q_lora_rank)
     q_up_proj = gemm_flops(
-        bs, config.q_lora_rank, tp_num_heads * config.qk_head_dim
+        bs, config.q_lora_rank, tp_heads * config.qk_head_dim
     )
 
     kv_down_proj = gemm_flops(
         bs, config.hidden_size, config.kv_lora_rank + config.qk_rope_head_dim
     )
 
-    bmm_q_wk = tp_num_heads * gemm_flops(
+    bmm_q_wk = tp_heads * gemm_flops(
         bs, config.qk_nope_head_dim, config.kv_lora_rank
     )
-    bmm_o_wv = tp_num_heads * gemm_flops(
+    bmm_o_wv = tp_heads * gemm_flops(
         bs, config.kv_lora_rank, config.v_head_dim
     )
 
     o_proj = gemm_flops(
-        bs, tp_num_heads * config.v_head_dim, config.hidden_size
+        bs, tp_heads * config.v_head_dim, config.hidden_size
     )
 
     attn_core = gemm_flops(
         bs,
-        tp_num_heads * (config.kv_lora_rank + config.qk_rope_head_dim),
+        tp_heads * (config.kv_lora_rank + config.qk_rope_head_dim),
         avg_context_len,
     ) + gemm_flops(
-        bs, avg_context_len, tp_num_heads * config.kv_lora_rank
+        bs, avg_context_len, tp_heads * config.kv_lora_rank
     )
 
     return (
@@ -110,10 +111,10 @@ def get_gqla_absorb_gflops(config, bs, avg_context_len):
 
 
 def get_mla_noabsorb_gflops(config, bs, avg_context_len, tp_size):
-    tp_num_heads = config.num_attention_heads // tp_size
+    tp_heads = tp_num_heads(config.num_attention_heads, tp_size)
     q_down_proj = gemm_flops(bs, config.hidden_size, config.q_lora_rank)
     q_up_proj = gemm_flops(
-        bs, config.q_lora_rank, tp_num_heads * config.qk_head_dim
+        bs, config.q_lora_rank, tp_heads * config.qk_head_dim
     )
 
     kv_down_proj = gemm_flops(
@@ -122,18 +123,18 @@ def get_mla_noabsorb_gflops(config, bs, avg_context_len, tp_size):
     kv_up_proj = gemm_flops(
         bs,
         config.kv_lora_rank,
-        tp_num_heads * (config.v_head_dim + config.qk_nope_head_dim),
+        tp_heads * (config.v_head_dim + config.qk_nope_head_dim),
     )
 
     o_proj = gemm_flops(
-        bs, tp_num_heads * config.v_head_dim, config.hidden_size
+        bs, tp_heads * config.v_head_dim, config.hidden_size
     )
 
     attn_core = gemm_flops(
         bs,
-        tp_num_heads * (config.qk_nope_head_dim + config.qk_rope_head_dim),
+        tp_heads * (config.qk_nope_head_dim + config.qk_rope_head_dim),
         avg_context_len,
-    ) + gemm_flops(bs, avg_context_len, tp_num_heads * config.v_head_dim)
+    ) + gemm_flops(bs, avg_context_len, tp_heads * config.v_head_dim)
 
     return (
         attn_core / 1e9,
@@ -160,6 +161,6 @@ def get_attn_gflops(
 
 def get_moe_gflops(config: ModelConfig, tp_size: int):
     # TP shards intermediate_size; hidden_size is NOT sharded
-    tp_intermediate_size = config.intermediate_size // tp_size
+    tp_intermediate_size = tp_intermediate(config.intermediate_size, tp_size)
     act = config.num_shared_experts + config.num_experts_per_tok
     return act * 3.0 * gemm_flops(1, config.hidden_size, tp_intermediate_size) / 1e9

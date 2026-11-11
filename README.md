@@ -12,10 +12,12 @@ For more details, please check [InferSim Technical Report](https://github.com/us
 
 | Model | GPU | Prefill TGS(Actual) | Prefill TGS(Sim) | Decode TGS(Actual) | Decode TGS(Sim) | Notes |
 | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| DeepSeek-V3 | H800 | 7839 | 9034 | 2324 | 2675 | Actual data from [deepseek/profile-data](https://github.com/deepseek-ai/profile-data/). Simulated with same setup: [example/deepseek-v3/](./example/deepseek-v3/). |
-| Qwen3-30B-A3B-BF16 | H20 | 16594 | 17350 | 2749 | 2632 | Actual data tested with SGLang, simulation example: [example/qwen3-30B-A3B/](./example/qwen3-30B-A3B/). |
-| Qwen3-8B-FP8 | H20 | 15061 | 16328 | 2682 | 2581 | Actual data tested with SGLang, simulation example: [example/qwen3-8B/](./example/qwen3-8B/). |
+| DeepSeek-V3 | H800 | 7839 | 8664 | 2324 | 2530 | Actual data from [deepseek/profile-data](https://github.com/deepseek-ai/profile-data/). Simulated with same setup: [example/deepseek-v3/](./example/deepseek-v3/). |
+| Qwen3-30B-A3B-BF16 | H20 | 16594 | 16677 | 2749 | 3014 | Actual data tested with SGLang, simulation example: [example/qwen3-30B-A3B/](./example/qwen3-30B-A3B/). |
+| Qwen3-8B-FP8 | H20 | 15061 | 15956 | 2682 | 2524 | Actual data tested with SGLang, simulation example: [example/qwen3-8B/](./example/qwen3-8B/). |
 | Qwen3.5-35B-A3B-FP8 | PRO5000 | 33139 | 36449 | 2150 | 2175 | Actual data tested with SGLang, simulation example: [example/qwen3-35B/](./example/qwen3.5-35B-A3B). |
+
+Sim columns for the first three rows are regenerated with the bundled example scripts. The Qwen3.5 PRO5000 row has no matching script in `example/` (that example targets H20) and is left as published.
 
 The accuracy of simulation results relies heavily on the kernel benchmark results. Please help us improve the [kernel_benchmark](./kernel_benchmark) and append the data to [bench_data](./bench_data).
 
@@ -26,6 +28,26 @@ The accuracy of simulation results relies heavily on the kernel benchmark result
 - **Linear**: GEMM. Benchmarked on DeepGEMM.
 - **Parallelization**: DP Attn, EP MoE.
 - **Large EP**: DeepEP dispatch and combine, with normal and low_latency mode.
+
+## Parallelism Model
+
+The same layout is used for weights, FLOPs, MFU lookups and communication (see `utils/parallel.py`):
+
+- **Attention**: tensor parallel over `--tp-size`, data parallel across the `world_size / tp_size` TP groups. When `tp_size > num_key_value_heads`, KV heads are replicated (one per rank).
+- **Dense FFN**: tensor parallel over `--tp-size` and replicated across TP groups, so it needs no cross-group communication. This includes the dense layers of MoE models (DeepSeek `first_k_dense_replace`, Qwen `mlp_only_layers`).
+- **MoE FFN**: intermediate size tensor parallel over `--tp-size`; routed experts expert-parallel over `ep_size = world_size / tp_size`. EP dispatch/combine (or the all-reduce stand-in) is charged only when `ep_size > 1`.
+- **TP all-reduce**: charged twice per layer (after attention and after the FFN); RDMA bandwidth is used when a TP group spans nodes.
+- **Linear attention (GDN)**: key/value heads are tensor parallel. If no benchmark exists for the sharded head count, full-head data is scaled by `1 / tp_size` and a warning is recorded.
+
+Bandwidths are SI (GB/s = 1e9 B/s); memory capacity is GiB. DeepSeek-V3.2 sparse attention (`index_topk`) is not modelled yet and is costed as dense MLA (a warning is printed).
+
+Every fallback (default MFU, extrapolated benchmark, KV cache that does not fit, SLO miss) is listed in a **Diagnostics** section at the end of the output. Pass `--strict` to exit with status 1 when any fallback was used.
+
+## Tests
+
+```
+python3 -m unittest discover -s tests
+```
 
 ## Help
 
@@ -44,7 +66,7 @@ usage: main.py [-h] --config-path CONFIG_PATH
                [--decode-scheduler-overhead-ms DECODE_SCHEDULER_OVERHEAD_MS]
                [--enable-shared-expert-overlap] [--enable-deepep]
                [--enable-tbo] [--sm-ratio SM_RATIO] [--prefill-only]
-               [--decode-only]
+               [--decode-only] [--strict]
 
 optional arguments:
   -h, --help            show this help message and exit
@@ -90,6 +112,9 @@ optional arguments:
   --sm-ratio SM_RATIO   In TBO DeepEP normal mode, the SM ratio used for computation
   --prefill-only        Only simulate prefill
   --decode-only         Only simulate decoding
+  --strict              Exit with status 1 if any default MFU, extrapolated
+                        benchmark, memory overflow or SLO miss was involved in
+                        the result
 ```
 
 ## Example

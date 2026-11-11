@@ -1,6 +1,13 @@
 from flops.flops import gemm_flops
-from hardware.gpu import TFLOPS_TO_GFLOPS, gpu_map
+from hardware.gpu import TFLOPS_TO_GFLOPS, gpu_map, transfer_time
 from mfu.mfu import get_attn_decode_perf, get_attn_prefill_mfu, get_gemm_mfu
+from utils.parallel import tp_num_heads, tp_num_kv_heads
+
+# Causal prefill only computes the lower triangle of QK^T, which halves the
+# FLOPs in theory. FA3/FlashMLA causal kernels still pay for the diagonal
+# blocks and load imbalance, so the empirically calibrated speedup over the
+# full (non-causal) FLOP count is ~1.8x rather than 2x.
+CAUSAL_PREFILL_SPEEDUP = 1.8
 
 
 def get_gemm_mfu_and_latency(m, k, n, device_type, use_fp8_gemm):
@@ -26,10 +33,10 @@ class MHA:
 
     def get_attn_core_gflops(self, bs, kv_len):
         # TP shards attention heads
-        tp_num_heads = self.config.num_attention_heads // self.tp_size
+        tp_heads = tp_num_heads(self.config.num_attention_heads, self.tp_size)
         attn_core = (
             gemm_flops(
-                bs, tp_num_heads * self.config.head_dim, kv_len
+                bs, tp_heads * self.config.head_dim, kv_len
             )
             * 2
         )
@@ -47,15 +54,8 @@ class MHA:
             attn_core_time = bs * attn_core_gflops / (
                 gpu.fp16_tflops * TFLOPS_TO_GFLOPS * attn_core_mfu
             )
-        kv_load_time = (
-            kvcache_bytes
-            * kv_len
-            * bs
-            / self.config.num_full_attn_layers
-            / 1024
-            / 1024
-            / 1024
-            / gpu.mem_bw
+        kv_load_time = transfer_time(
+            kvcache_bytes * kv_len * bs / self.config.num_full_attn_layers, gpu.mem_bw
         )
 
         print("{:<40} {:<10.2f}".format("Attn core MFU:", attn_core_mfu))
@@ -71,11 +71,11 @@ class MHA:
 
     def decode_attn_others(self, bs, device_type):
         # TP shards heads; hidden_size is NOT sharded
-        tp_num_heads = self.config.num_attention_heads // self.tp_size
-        tp_num_kv_heads = self.config.num_key_value_heads // self.tp_size
+        tp_heads = tp_num_heads(self.config.num_attention_heads, self.tp_size)
+        tp_kv_heads = tp_num_kv_heads(self.config.num_key_value_heads, self.tp_size)
         q_multiplier = 2 if self.config.attn_output_gate else 1
         qkv_output_size = (
-            q_multiplier * tp_num_heads + 2 * tp_num_kv_heads
+            q_multiplier * tp_heads + 2 * tp_kv_heads
         ) * self.config.head_dim
 
         qkv_proj = get_gemm_mfu_and_latency(
@@ -89,7 +89,7 @@ class MHA:
 
         o_proj = get_gemm_mfu_and_latency(
             m=bs,
-            k=tp_num_heads * self.config.head_dim,
+            k=tp_heads * self.config.head_dim,
             n=self.config.hidden_size,
             device_type=device_type,
             use_fp8_gemm=self.use_fp8_gemm,
@@ -109,17 +109,11 @@ class MHA:
         attn_core_time = (
             seq_len
             * attn_core_gflops
-            / 1.8
+            / CAUSAL_PREFILL_SPEEDUP
             / (gpu.fp16_tflops * TFLOPS_TO_GFLOPS * attn_core_mfu)
         )
-        kv_load_time = (
-            kvcache_bytes
-            * seq_len
-            / self.config.num_full_attn_layers
-            / 1024
-            / 1024
-            / 1024
-            / gpu.mem_bw
+        kv_load_time = transfer_time(
+            kvcache_bytes * seq_len / self.config.num_full_attn_layers, gpu.mem_bw
         )
 
         print("{:<40} {:<10.2f}".format("Attn core MFU:", attn_core_mfu))
@@ -143,24 +137,27 @@ class MLA(MHA):
         self.prefill_mfu = prefill_mfu
 
     def get_attn_core_gflops_absorb(self, bs, kv_len):
+        # TP shards attention heads (the latent KV is shared by all heads)
+        tp_heads = tp_num_heads(self.config.num_attention_heads, self.tp_size)
         attn_core = gemm_flops(
             bs,
-            self.config.num_attention_heads
+            tp_heads
             * (self.config.kv_lora_rank + self.config.qk_rope_head_dim),
             kv_len,
         ) + gemm_flops(
-            bs, kv_len, self.config.num_attention_heads * self.config.kv_lora_rank
+            bs, kv_len, tp_heads * self.config.kv_lora_rank
         )
         return attn_core / 1e9
 
     def get_attn_core_gflops_noabsorb(self, bs, kv_len):
+        tp_heads = tp_num_heads(self.config.num_attention_heads, self.tp_size)
         attn_core = gemm_flops(
             bs,
-            self.config.num_attention_heads
+            tp_heads
             * (self.config.qk_nope_head_dim + self.config.qk_rope_head_dim),
             kv_len,
         ) + gemm_flops(
-            bs, kv_len, self.config.num_attention_heads * self.config.v_head_dim
+            bs, kv_len, tp_heads * self.config.v_head_dim
         )
         return attn_core / 1e9
 
@@ -178,15 +175,8 @@ class MLA(MHA):
                 * attn_core_gflops
                 / (gpu.fp16_tflops * TFLOPS_TO_GFLOPS * attn_core_mfu)
             )
-        kv_load_time = (
-            kvcache_bytes
-            * kv_len
-            * bs
-            / self.config.num_hidden_layers
-            / 1024
-            / 1024
-            / 1024
-            / gpu.mem_bw
+        kv_load_time = transfer_time(
+            kvcache_bytes * kv_len * bs / self.config.num_hidden_layers, gpu.mem_bw
         )
 
         print("{:<40} {:<10.2f}".format("Attn core MFU:", attn_core_mfu))
@@ -202,7 +192,7 @@ class MLA(MHA):
 
     def decode_attn_others(self, bs, device_type):
         # TP shards attention heads; hidden_size and lora ranks are NOT sharded
-        tp_num_heads = self.config.num_attention_heads // self.tp_size
+        tp_heads = tp_num_heads(self.config.num_attention_heads, self.tp_size)
         q_down_proj = get_gemm_mfu_and_latency(
             m=bs,
             k=self.config.hidden_size,
@@ -215,7 +205,7 @@ class MLA(MHA):
         q_up_proj = get_gemm_mfu_and_latency(
             m=bs,
             k=self.config.q_lora_rank,
-            n=tp_num_heads * self.config.qk_head_dim,
+            n=tp_heads * self.config.qk_head_dim,
             device_type=device_type,
             use_fp8_gemm=self.use_fp8_gemm,
         )
@@ -234,7 +224,7 @@ class MLA(MHA):
 
         bmm_q_wk = get_gemm_mfu_and_latency(
             m=bs,
-            k=tp_num_heads * self.config.qk_nope_head_dim,
+            k=tp_heads * self.config.qk_nope_head_dim,
             n=self.config.kv_lora_rank,
             device_type=device_type,
             use_fp8_gemm=self.use_fp8_gemm,
@@ -243,7 +233,7 @@ class MLA(MHA):
 
         bmm_o_wv = get_gemm_mfu_and_latency(
             m=bs,
-            k=tp_num_heads * self.config.kv_lora_rank,
+            k=tp_heads * self.config.kv_lora_rank,
             n=self.config.v_head_dim,
             device_type=device_type,
             use_fp8_gemm=self.use_fp8_gemm,
@@ -252,7 +242,7 @@ class MLA(MHA):
 
         o_proj = get_gemm_mfu_and_latency(
             m=bs,
-            k=tp_num_heads * self.config.v_head_dim,
+            k=tp_heads * self.config.v_head_dim,
             n=self.config.hidden_size,
             device_type=device_type,
             use_fp8_gemm=self.use_fp8_gemm,
@@ -272,17 +262,11 @@ class MLA(MHA):
         attn_core_time = (
             seq_len
             * attn_core_gflops
-            / 1.8
+            / CAUSAL_PREFILL_SPEEDUP
             / (gpu.fp16_tflops * TFLOPS_TO_GFLOPS * attn_core_mfu)
         )
-        kv_load_time = (
-            kvcache_bytes
-            * seq_len
-            / self.config.num_hidden_layers
-            / 1024
-            / 1024
-            / 1024
-            / gpu.mem_bw
+        kv_load_time = transfer_time(
+            kvcache_bytes * seq_len / self.config.num_hidden_layers, gpu.mem_bw
         )
 
         print("{:<40} {:<10.2f}".format("Attn core MFU:", attn_core_mfu))

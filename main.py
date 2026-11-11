@@ -1,8 +1,11 @@
 import argparse
+import sys
 
 from config.model_config import ModelConfig
 from models.hybrid_model import HybridModel
 from models.model import Model
+from utils import parallel
+from utils.diagnostics import get_warnings
 
 
 def mfu_value(value):
@@ -19,8 +22,50 @@ def non_negative_float(value):
     return value
 
 
+def positive_int(value):
+    value = int(value)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return value
+
+
+def positive_float(value):
+    value = float(value)
+    if not 0 < value < float("inf"):
+        raise argparse.ArgumentTypeError("value must be finite and greater than 0")
+    return value
+
+
+def validate(args, config):
+    """Reject layouts the simulator cannot model instead of printing nonsense."""
+    if args.prefill_only and args.decode_only:
+        raise ValueError("--prefill-only and --decode-only are mutually exclusive")
+    parallel.gpus_per_node(args.world_size, args.num_nodes)
+    ep = parallel.ep_size(args.world_size, args.tp_size)
+    parallel.tp_num_heads(config.num_attention_heads, args.tp_size)
+    if config.attn_type == "MHA/GQA":
+        parallel.tp_num_kv_heads(config.num_key_value_heads, args.tp_size)
+    parallel.tp_intermediate(config.intermediate_size, args.tp_size)
+    if config.is_moe:
+        if config.num_routed_experts % ep != 0:
+            raise ValueError(
+                f"num_routed_experts={config.num_routed_experts} is not divisible "
+                f"by ep_size=world_size/tp_size={ep}"
+            )
+        if config.num_dense_ffn_layers > 0:
+            parallel.tp_intermediate(config.dense_intermediate_size, args.tp_size)
+    if config.is_hybrid_linear:
+        parallel.tp_num_heads(config.linear_num_key_heads, args.tp_size)
+        parallel.tp_num_heads(config.linear_num_value_heads, args.tp_size)
+        if args.enable_tbo:
+            raise ValueError("--enable-tbo is not modelled for hybrid linear models")
+    if not 0 < args.sm_ratio <= 1:
+        raise ValueError("--sm-ratio must be in (0, 1]")
+
+
 def main(args):
     config = ModelConfig(args.config_path)
+    validate(args, config)
 
     enable_shared_expert_overlap = getattr(
         args, "enable_shared_expert_overlap", False
@@ -56,11 +101,22 @@ def main(args):
     model.print_kvcache_info()
     model.print_flops_info()
 
+    results = {}
     if not args.decode_only:
-        model.prefill()
+        results.update(model.prefill() or {})
 
     if not args.prefill_only:
-        model.decoding()
+        results.update(model.decoding() or {})
+
+    warnings = get_warnings()
+    print("{s:{c}^{n}}".format(s="Diagnostics", n=50, c="-"))
+    print("{:<40} {:<10}".format("Warnings / fallbacks used:", len(warnings)))
+    for w in warnings:
+        print(f"  - {w}")
+    if getattr(args, "strict", False) and warnings:
+        print("Strict mode: failing because the result relies on fallbacks.")
+        sys.exit(1)
+    return results
 
 
 if __name__ == "__main__":
@@ -78,17 +134,17 @@ if __name__ == "__main__":
         choices=["H20", "H800", "H200", "GB200", "PRO5000"],
         help="Device type",
     )
-    parser.add_argument("--world-size", type=int, default=1, help="Num of GPUs")
+    parser.add_argument("--world-size", type=positive_int, default=1, help="Num of GPUs")
     parser.add_argument(
         "--tp-size",
-        type=int,
+        type=positive_int,
         default=1,
         help="Tensor parallel size. If >1, both attention and MoE use TP; if =1, attention uses DP and MoE uses EP.",
     )
-    parser.add_argument("--num-nodes", type=int, default=1, help="Num of nodes")
+    parser.add_argument("--num-nodes", type=positive_int, default=1, help="Num of nodes")
     parser.add_argument(
         "--max-prefill-tokens",
-        type=int,
+        type=positive_int,
         default=4096,
         help="Max prefill tokens per GPU",
     )
@@ -106,18 +162,18 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--decode-bs",
-        type=int,
+        type=positive_int,
         help="Decoding batchsize per GPU. If not specified, bs = tgs * tpot.",
     )
     parser.add_argument(
-        "--target-tgs", type=float, default=2560, help="Target tokens/s per GPU"
+        "--target-tgs", type=positive_float, default=2560, help="Target tokens/s per GPU"
     )
-    parser.add_argument("--target-tpot", type=float, default=50, help="TPOT in ms")
+    parser.add_argument("--target-tpot", type=positive_float, default=50, help="TPOT in ms")
     parser.add_argument(
-        "--target-isl", type=int, default=4096, help="Input sequence length, in tokens"
+        "--target-isl", type=positive_int, default=4096, help="Input sequence length, in tokens"
     )
     parser.add_argument(
-        "--target-osl", type=int, default=2048, help="Output sequence length, in tokens"
+        "--target-osl", type=positive_int, default=2048, help="Output sequence length, in tokens"
     )
     parser.add_argument("--use-fp8-gemm", action="store_true", help="Use fp8 gemm")
     parser.add_argument("--use-fp8-kv", action="store_true", help="Use fp8 kvcache")
@@ -154,5 +210,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--decode-only", action="store_true", help="Only simulate decoding"
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "Exit with status 1 if any default MFU, extrapolated benchmark, "
+            "memory overflow or SLO miss was involved in the result"
+        ),
+    )
     args = parser.parse_args()
-    main(args)
+    try:
+        main(args)
+    except (ValueError, FileNotFoundError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
